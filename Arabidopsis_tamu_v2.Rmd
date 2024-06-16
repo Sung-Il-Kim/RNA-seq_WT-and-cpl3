@@ -1,0 +1,323 @@
+---
+title: "Arabidopsis_tamu_v2"
+output: html_document
+date: "2024-06-08"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,eval = F)
+
+setwd("F:/backup/UK/20240523/2_R_project/Project2024/Arabidopsis_tamu")
+
+library(rtracklayer)
+library(tidyr)
+library(ggplot2)
+library(ggsci)
+
+getTransRange <- function(exon){
+  gr <- GenomicRanges::split(exon,exon$transcript_id)
+  gr <- unlist(range(gr))
+  gr$transcript_id <- names(gr)
+  names(gr) <- NULL
+  # gr <- sort(gr,by=~seqnames+start+end)
+  gr
+}
+
+rowmean<-function(x,group,reorder=F,na.rm=T){
+  order.idx<-as.character(unique(group))
+  if (reorder)
+    order.idx<-gtools::mixedsort(order.idx)
+  
+  counts <- table(group)[order.idx]
+  sums <- rowsum(x, group = group)[order.idx,]
+  means <- (diag(1/counts)) %*% as.matrix(sums)
+  rownames(means) <- order.idx
+  if (na.rm)
+    means[is.na(means)] <- 0
+  return(means)
+}
+
+
+
+```
+
+## DAS genes
+
+  - 3D RNA-seq analysis to generate DAS genes
+  - Subset AS events from Suppa for DAS genes
+
+```{r}
+load('data/intermediate_data.RData')
+DAS_genes <- intermediate_data$DAS_gene
+DAS_genes_list <- split(DAS_genes$target,DAS_genes$contrast)
+# genes <- genes[c('cpl3.mock-WT.mock','cpl3.flg22-WT.flg22')]
+DAS_genes_list <- DAS_genes_list[c("WT.flg22-WT.mock","cpl3.flg22-cpl3.mock")]
+lengths(DAS_genes_list)
+
+DAS_genes <- unique(DAS_genes$target)
+length(DAS_genes)
+
+
+
+```
+
+## CDS & UTR
+
+Extract CDS start and end from atRTD3_TS_21Feb22_transfix.gtf
+
+```{r}
+rtd <- import('data/atRTD3_TS_21Feb22_transfix.gtf')
+
+trans <- rtd[rtd$type=='exon']
+trans <- getTransRange(trans)
+trans$gene_id <- gsub('[.].*','',trans$transcript_id)
+trans <- trans[trans$gene_id %in% DAS_genes]
+
+cds <- rtd[rtd$type=='CDS']
+cds <- getTransRange(cds)
+cds$gene_id <- gsub('[.].*','',cds$transcript_id)
+cds <- cds[cds$gene_id %in% DAS_genes]
+cds_start <- start(cds)
+names(cds_start) <- cds$transcript_id
+
+cds_end <- end(cds)
+names(cds_end) <- cds$transcript_id
+
+utr3 <- rtd[rtd$type=='three_prime_utr']
+utr3 <- getTransRange(utr3)
+utr3$gene_id <- gsub('[.].*','',utr3$transcript_id)
+utr3 <- utr3[utr3$gene_id %in% DAS_genes]
+
+utr5 <- rtd[rtd$type=='five_prime_utr']
+utr5 <- getTransRange(utr5)
+utr5$gene_id <- gsub('[.].*','',utr5$transcript_id)
+utr5 <- utr5[utr5$gene_id %in% DAS_genes]
+
+```
+
+## DeltaPS
+
+TPM of AtRTD3 and Suppa to generate event PSI
+
+
+```{r}
+PSI_local_event <- read.delim("data/PSI_local_event.psi", row.names=1)
+
+###
+name_idx <- rownames(PSI_local_event)
+genes_idx <- gsub(';.*','',name_idx)
+
+psi <- PSI_local_event[which(genes_idx %in% DAS_genes),grep('WT|cpl3',colnames(PSI_local_event))]
+psi <- data.frame(psi)
+head(PSI_local_event)
+head(psi)
+
+
+idx <- gsub('[.]X.*','',colnames(psi))
+psi_ave <- rowmean(x = t(psi),group = idx,reorder = F)
+psi_ave <- t(psi_ave)
+
+dpsi <- cbind(psi_ave[,2]-psi_ave[,1],psi_ave[,4]-psi_ave[,3])
+colnames(dpsi) <- c("WT.flg22-WT.mock","cpl3.flg22-cpl3.mock")
+head(dpsi)
+
+
+```
+
+
+## AS events
+
+AtRTD3 and Suppa to generate AS events
+
+```{r}
+suppa_AS <- read.delim("data/suppa_AS.ioe")
+event_trans <- separate_rows(data = suppa_AS,alternative_transcripts,sep = ',')
+event_trans <- separate_rows(data = event_trans,total_transcripts,sep = ',')
+
+event_trans <- event_trans[event_trans$alternative_transcripts!=event_trans$total_transcripts,]
+event_trans <- unique(event_trans)
+event_trans <- as.data.frame(event_trans)
+event_trans_das <- event_trans[event_trans$gene_id %in% DAS_genes,]
+head(event_trans_das)
+
+###########
+idx <- event_trans_das$event_id
+# genes <- gsub(';.*','',idx)
+idx <- gsub('.*;','',idx)
+strand_idx <- gsub('.*:','',idx)
+idx <- strsplit(idx,split = ';|:|-')
+events <- sapply(idx, function(x) x[1])
+event_start <- as.numeric(sapply(idx, function(x) x[3]))
+event_end <- as.numeric(sapply(idx, function(x) x[length(x)-1]))
+event_position <- round((event_start+event_end)/2,0)
+event_trans_das$events <- events
+event_trans_das$event_start <- event_start
+event_trans_das$event_end <- event_end
+event_trans_das$event_position <- event_position
+event_trans_das$strand <- strand_idx
+
+event_trans_das$`WT.flg22-WT.mock` <- dpsi[event_trans_das$event_id,'WT.flg22-WT.mock']
+event_trans_das$`cpl3.flg22-cpl3.mock` <- dpsi[event_trans_das$event_id,'cpl3.flg22-cpl3.mock']
+event_trans_das$total_transcripts <- NULL
+event_trans_das <- unique(event_trans_das)
+# event_trans_das <- makeGRangesFromDataFrame(event_trans_das,keep.extra.columns = T)
+
+idx <- which(event_trans_das$alternative_transcripts %in% names(cds_start))
+event_trans_das$cds_start <- NA
+event_trans_das$cds_start[idx] <- cds_start[event_trans_das$alternative_transcripts[idx]]
+
+idx <- which(event_trans_das$alternative_transcripts %in% names(cds_end))
+event_trans_das$cds_end <- NA
+event_trans_das$cds_end[idx] <- cds_end[event_trans_das$alternative_transcripts[idx]]
+
+event_trans_das$cds_width <- event_trans_das$cds_end - event_trans_das$cds_start + 1
+
+
+head(event_trans_das)
+```
+
+
+## Event position
+```{r}
+
+event_trans_das$`event_position-cds_start` <- event_trans_das$event_position-event_trans_das$cds_start
+event_trans_das$`event_position-cds_end` <- event_trans_das$event_position-event_trans_das$cds_end
+
+## for negative strand, switch start and end, and sign of the substitution
+idx <- which(event_trans_das$strand=='-')
+d_start <- event_trans_das$`event_position-cds_start`[idx]
+d_end <- event_trans_das$`event_position-cds_end`[idx]
+event_trans_das$`event_position-cds_start`[idx] <- -d_end
+event_trans_das$`event_position-cds_end`[idx] <- -d_start
+
+## Location
+location <- paste0(sign(event_trans_das$`event_position-cds_start`),sign(event_trans_das$`event_position-cds_end`))
+
+## remove some NA info 
+idx <- which(location %in% c('-1-1','1-1','11'))
+event_trans_das <- event_trans_das[idx,]
+location <- location[idx]
+location <- gsub('-1-1','UTR5',location)
+location <- gsub('1-1','CDS',location)
+location <- gsub('11','UTR3',location)
+
+
+event_trans_das$location <- location
+event_trans_das$relative_location <- event_trans_das$`event_position-cds_start`/event_trans_das$cds_width
+save(event_trans_das,file='data/event_trans_das.RData')
+```
+
+## Summary
+```{r}
+dat1 <- dat2 <- event_trans_das
+
+dat1$event_deltaPS <- dat1$`WT.flg22-WT.mock`
+dat1$contrast <- 'WT.flg22-WT.mock'
+dat1$`WT.flg22-WT.mock` <- NULL
+dat1$`cpl3.flg22-cpl3.mock` <- NULL
+
+dat2$event_deltaPS <- dat2$`cpl3.flg22-cpl3.mock`
+dat2$contrast <- 'cpl3.flg22-cpl3.mock'
+dat2$`WT.flg22-WT.mock` <- NULL
+dat2$`cpl3.flg22-cpl3.mock` <- NULL
+
+event_trans_das_contrast <- rbind(dat1,dat2)
+
+# filter with deltaps > 10%
+event_trans_das_contrast <- event_trans_das_contrast[abs(event_trans_das_contrast$event_deltaPS) >=0.1,]
+event_trans_das_contrast$group <- paste0(event_trans_das_contrast$events,':',event_trans_das_contrast$contrast)
+
+indicator <- split(event_trans_das_contrast$location,event_trans_das_contrast$group)
+data2plot <- lapply(names(indicator), function(i){
+  x <- indicator[[i]]
+  dat <- data.frame(table(x))
+  dat$event <- gsub(':.*','',i)
+  dat$contrast <- gsub('.*:','',i)
+  colnames(dat)[1:2] <- c('region','number')
+  dat
+})
+
+data2plot <- do.call(rbind,data2plot)
+data2plot$region <- factor(data2plot$region,levels = c('UTR5','CDS','UTR3'))
+data2plot$event <- factor(data2plot$event,levels = c('RI','A3','A5','SE','AF','AL','MX'))
+
+
+g <- ggplot(data2plot,aes(x=contrast,y=number))+
+  geom_bar(position = 'dodge', stat='identity',aes(fill=region))+
+  facet_grid(.~event,scales = 'free_y')+
+  # geom_text(aes(label=number),
+  #           position=position_dodge(width=0.9), vjust=-0.25,size=2)+
+  scale_fill_npg()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(x='Contrast',y='AS event number',
+       title = 'Number of AS events in different regions (|deltaPS| > 0.1)')
+
+png('Number of AS events in different regions deltaPS0.1.png',
+    width = 9,height = 5,units = 'in',res = 300)
+print(g)
+dev.off()
+
+indicator <- split(event_trans_das_contrast,event_trans_das_contrast$group)
+data2plot <- lapply(names(indicator), function(i){
+  x <- indicator[[i]]
+  x$relative_location <- round(x$relative_location,1)
+  y <- split(x$relative_location,x$group)
+  y <- lapply(y, function(w) w[w<=2 & w >=-1])
+  dat <- lapply(y, function(z){
+    z <- data.frame(table(z))
+    colnames(z) <- c('region','number')
+    z$region <- as.numeric(levels(z$region))
+    z$event <- gsub(':.*','',i)
+    z$contrast <- gsub('.*:','',i)
+    z
+  })
+  do.call(rbind,dat)
+})
+
+data2plot <- do.call(rbind,data2plot)
+data2plot$event <- factor(data2plot$event,levels = c('RI','A3','A5','SE','AF','AL','MX'))
+# data2plot$region <- as.numeric(data2plot$region)
+
+g <- ggplot(data2plot,aes(x=region,y=number))+
+  geom_line(aes(colour = contrast),linewidth=1)+
+  facet_grid(event ~ .,scales = 'free_y')+
+  scale_x_continuous(breaks = c(-1,0,1,2),labels = c('UTR5\n(-100% CDS)','CDS start','CDS end','UTR3\n(+100% CDS)'))+
+  scale_color_npg()+
+  theme(legend.position = 'bottom')+
+  geom_vline(xintercept = c(0,1), linetype="dashed", color = "black", size=0.5)+
+  labs(x='bin width=10%',title = 'Distribution of AS events in different regions (|deltaPS| > 10%)')
+
+png('Distribution of AS events in different regions deltaPS0.1.png',
+    width = 6,height = 8,units = 'in',res = 300)
+print(g)
+dev.off()
+
+
+write.csv(event_trans_das_contrast,'event_trans_das_contrast.csv',row.names = F)
+
+
+## 
+load('data/event_trans_das_contrast.RData')
+
+
+data2plot <- event_trans_das_contrast[,c('events',"event_deltaPS","contrast","location")]
+data2plot$event_deltaPS <- abs(data2plot$event_deltaPS)
+colnames(data2plot)[c(1:2,4)] <- c('event','number','region')
+data2plot$region <- factor(data2plot$region,levels = c('UTR5','CDS','UTR3'))
+data2plot$event <- factor(data2plot$event,levels = c('RI','A3','A5','SE','AF','AL','MX'))
+
+g <- ggplot(data2plot,aes(x=contrast,y=number))+
+  geom_boxplot(aes(fill=region))+
+  facet_grid(.~event,scales = 'free_y')+
+  scale_fill_npg()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(x='Contrast',y='AS event deltaPS',
+       title = 'DeltaPS of AS events in different regions (outliers removed; |deltaPS| > 0.1)')
+
+png('DeltaPS of AS events in different regions.png',
+    width = 9,height = 5,units = 'in',res = 300)
+print(g)
+dev.off()
+```
